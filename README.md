@@ -12,6 +12,16 @@
 </br>
 <table>
   <tr>
+    <td align="center" width="888px"><b>HELP + SUPPORT</b></td>
+  </tr>
+  <tr>
+    <td>
+      This repository is archived and issues are not actively read. For support with issues, please check the Stardew Valley official forums: http://community.playstarbound.com/threads/stardew-modding-api-0-40-1-1.108375/
+    </td>
+  </tr>
+</table>
+<table>
+  <tr>
     <td align="center" width="888px"><b>ABOUT</b></td>
   </tr>
   <tr>
@@ -26,7 +36,7 @@
   </tr>
   <tr>
     <td>
-      <a href="https://www.microsoft.com/en-us/download/details.aspx?id=49981">Microsoft .NET Framework 4.6.1</a>
+      <a href="https://www.microsoft.com/en-gb/download/details.aspx?id=30653">Microsoft .NET Framework 4.5</a>
     </td>
   </tr>
 </table>
