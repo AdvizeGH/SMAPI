@@ -1,25 +1,29 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
+#if SMAPI_FOR_WINDOWS
 using System.Windows.Forms;
+#endif
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI.Events;
 using StardewModdingAPI.Inheritance;
-using StardewModdingAPI.Inheritance.Menus;
 using StardewValley;
-using StardewValley.Menus;
 
 namespace StardewModdingAPI
 {
     public class Program
     {
-        private static List<string> _modPaths;
+        /// <summary>The full path to the Stardew Valley executable.</summary>
+        private static readonly string GameExecutablePath = File.Exists(Path.Combine(Constants.ExecutionPath, "StardewValley.exe"))
+            ? Path.Combine(Constants.ExecutionPath, "StardewValley.exe") // Linux or Mac
+            : Path.Combine(Constants.ExecutionPath, "Stardew Valley.exe"); // Windows
+
+        /// <summary>The full path to the folder containing mods.</summary>
+        private static readonly string ModPath = Path.Combine(Constants.ExecutionPath, "Mods");
 
         public static SGame gamePtr;
         public static bool ready;
@@ -27,11 +31,9 @@ namespace StardewModdingAPI
         public static Assembly StardewAssembly;
         public static Type StardewProgramType;
         public static FieldInfo StardewGameInfo;
-        public static Form StardewForm;
 
         public static Thread gameThread;
         public static Thread consoleInputThread;
-        //private static List<string> _modContentPaths;
 
         public static Texture2D DebugPixel { get; private set; }
 
@@ -53,10 +55,8 @@ namespace StardewModdingAPI
                 Log.AsyncY("SDV Version: " + Game1.version);
                 Log.AsyncY("SMAPI Version: " + Constants.Version.VersionString);
                 ConfigureUI();
-                ConfigurePaths();
-                ConfigureSDV();
-
-                GameRunInvoker();
+                CreateDirectories();
+                StartGame();
             }
             catch (Exception e)
             {
@@ -76,48 +76,29 @@ namespace StardewModdingAPI
         private static void ConfigureUI()
         {
             Console.Title = Constants.ConsoleTitle;
-
 #if DEBUG
             Console.Title += " - DEBUG IS NOT FALSE, AUTHOUR NEEDS TO REUPLOAD THIS VERSION";
 #endif
         }
 
-        /// <summary>
-        ///     Setup the required paths and logging
-        /// </summary>
-        private static void ConfigurePaths()
+        /// <summary>Create and verify the SMAPI directories.</summary>
+        private static void CreateDirectories()
         {
-            Log.AsyncY("Validating api paths...");
-
-            _modPaths = new List<string> {Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "StardewValley", "Mods"), Path.Combine(Constants.ExecutionPath, "Mods")};
-            //_modContentPaths = new List<string>();
-
-            //TODO: Have an app.config and put the paths inside it so users can define locations to load mods from
-
-            //Mods need to make their own content paths, since we're doing a different, manifest-driven, approach.
-            //_modContentPaths.Add(Path.Combine(Constants.ExecutionPath, "Mods", "Content"));
-            //_modContentPaths.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "StardewValley", "Mods", "Content"));
-
-            //Checks that all defined modpaths exist as directories
-            _modPaths.ForEach(VerifyPath);
-            //_modContentPaths.ForEach(path => VerifyPath(path));
+            Log.AsyncY("Validating file paths...");
+            VerifyPath(ModPath);
             VerifyPath(Constants.LogDir);
-
-            if (!File.Exists(Constants.ExecutionPath + "\\Stardew Valley.exe"))
-            {
-                throw new FileNotFoundException($"Could not found: {Constants.ExecutionPath}\\Stardew Valley.exe");
-            }
+            if (!File.Exists(GameExecutablePath))
+                throw new FileNotFoundException($"Could not find executable: {GameExecutablePath}");
         }
 
         /// <summary>
-        ///     Load Stardev Valley and control features
+        ///     Load Stardev Valley and control features, and launch the game.
         /// </summary>
-        private static void ConfigureSDV()
+        private static void StartGame()
         {
-            Log.AsyncY("Initializing SDV Assembly...");
-
             // Load in the assembly - ignores security
-            StardewAssembly = Assembly.UnsafeLoadFrom(Constants.ExecutionPath + "\\Stardew Valley.exe");
+            Log.AsyncY("Initializing SDV Assembly...");
+            StardewAssembly = Assembly.UnsafeLoadFrom(GameExecutablePath);
             StardewProgramType = StardewAssembly.GetType("StardewValley.Program", true);
             StardewGameInfo = StardewProgramType.GetField("gamePtr");
 
@@ -125,83 +106,101 @@ namespace StardewModdingAPI
             Log.AsyncY("Injecting New SDV Version...");
             Game1.version += $"-Z_MODDED | SMAPI {Constants.Version.VersionString}";
 
-            // Create the thread for the game to run in.
-            gameThread = new Thread(RunGame);
-            Log.AsyncY("Starting SDV...");
-            gameThread.Start();
+            // add error interceptors
+#if SMAPI_FOR_WINDOWS
+            Application.ThreadException += Log.Application_ThreadException;
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+#endif
+            AppDomain.CurrentDomain.UnhandledException += Log.CurrentDomain_UnhandledException;
 
-            // Wait for the game to load up
-            while (!ready)
+            // initialise game
+            try
             {
-            }
+                Log.AsyncY("Initializing SDV...");
+                gamePtr = new SGame();
 
-            //SDV is running
-            Log.AsyncY("SDV Loaded Into Memory");
+                // hook events
+                gamePtr.Exiting += (sender, e) => ready = false;
+                gamePtr.Window.ClientSizeChanged += GraphicsEvents.InvokeResize;
 
-            //Create definition to listen for input
-            Log.AsyncY("Initializing Console Input Thread...");
-            consoleInputThread = new Thread(ConsoleInputThread);
+                // patch graphics
+                Log.AsyncY("Patching SDV Graphics Profile...");
+                Game1.graphics.GraphicsProfile = GraphicsProfile.HiDef;
 
-            // The only command in the API (at least it should be, for now)
-            Command.RegisterCommand("help", "Lists all commands | 'help <cmd>' returns command description").CommandFired += help_CommandFired;
-            //Command.RegisterCommand("crash", "crashes sdv").CommandFired += delegate { Game1.player.draw(null); };
+                // load mods
+                LoadMods();
 
-            //Subscribe to events
-            ControlEvents.KeyPressed += Events_KeyPressed;
-            GameEvents.LoadContent += Events_LoadContent;
-            //Events.MenuChanged += Events_MenuChanged; //Idk right now
-
-            Log.AsyncY("Applying Final SDV Tweaks...");
-            StardewInvoke(() =>
-            {
+                // initialise
+                StardewGameInfo.SetValue(StardewProgramType, gamePtr);
+                Log.AsyncY("Applying Final SDV Tweaks...");
                 gamePtr.IsMouseVisible = false;
                 gamePtr.Window.Title = "Stardew Valley - Version " + Game1.version;
-                StardewForm.Resize += GraphicsEvents.InvokeResize;
-            });
-        }
-
-        /// <summary>
-        ///     Wrap the 'RunGame' method for console output
-        /// </summary>
-        private static void GameRunInvoker()
-        {
-            //Game's in memory now, send the event
-            Log.AsyncY("Game Loaded");
-            GameEvents.InvokeGameLoaded();
-
-            Log.AsyncY("Type 'help' for help, or 'help <cmd>' for a command's usage");
-            //Begin listening to input
-            consoleInputThread.Start();
-
-
-            while (ready)
+            }
+            catch (Exception ex)
             {
-                //Check if the game is still running 10 times a second
-                Thread.Sleep(1000 / 10);
+                Log.AsyncR("Game failed to initialise: " + ex);
+                return;
             }
 
-            //abort the thread, we're closing
-            if (consoleInputThread != null && consoleInputThread.ThreadState == ThreadState.Running)
-                consoleInputThread.Abort();
+            // initialise after game launches
+            new Thread(() =>
+            {
+                // Wait for the game to load up
+                while (!ready) Thread.Sleep(1000);
 
-            Log.AsyncY("Game Execution Finished");
-            Log.AsyncY("Shutting Down...");
-            Thread.Sleep(100);
-            Environment.Exit(0);
+                // Create definition to listen for input
+                Log.AsyncY("Initializing Console Input Thread...");
+                consoleInputThread = new Thread(ConsoleInputThread);
+
+                // The only command in the API (at least it should be, for now)
+                Command.RegisterCommand("help", "Lists all commands | 'help <cmd>' returns command description").CommandFired += help_CommandFired;
+
+                // Subscribe to events
+                ControlEvents.KeyPressed += Events_KeyPressed;
+                GameEvents.LoadContent += Events_LoadContent;
+
+                // Game's in memory now, send the event
+                Log.AsyncY("Game Loaded");
+                GameEvents.InvokeGameLoaded();
+
+                // Listen for command line input
+                Log.AsyncY("Type 'help' for help, or 'help <cmd>' for a command's usage");
+                consoleInputThread.Start();
+                while (ready)
+                    Thread.Sleep(1000 / 10); // Check if the game is still running 10 times a second
+
+                // Abort the thread, we're closing
+                if (consoleInputThread != null && consoleInputThread.ThreadState == ThreadState.Running)
+                    consoleInputThread.Abort();
+
+                Log.AsyncY("Game Execution Finished");
+                Log.AsyncY("Shutting Down...");
+                Thread.Sleep(100);
+                Environment.Exit(0);
+            }).Start();
+
+            // Start game loop
+            Log.AsyncY("Starting SDV...");
+            try
+            {
+                ready = true;
+                gamePtr.Run();
+            }
+            catch (Exception ex)
+            {
+                ready = false;
+                Log.AsyncR("Game failed to start: " + ex);
+            }
         }
 
-        /// <summary>
-        ///     Create the given directory path if it does not exist
-        /// </summary>
-        /// <param name="path">Desired directory path</param>
+        /// <summary>Create a directory path if it doesn't exist.</summary>
+        /// <param name="path">The directory path.</param>
         private static void VerifyPath(string path)
         {
             try
             {
                 if (!Directory.Exists(path))
-                {
                     Directory.CreateDirectory(path);
-                }
             }
             catch (Exception ex)
             {
@@ -211,152 +210,105 @@ namespace StardewModdingAPI
 
         /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-        public static void RunGame()
-        {
-            Application.ThreadException += Log.Application_ThreadException;
-            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-            AppDomain.CurrentDomain.UnhandledException += Log.CurrentDomain_UnhandledException;
-
-            try
-            {
-                gamePtr = new SGame();
-                Log.AsyncY("Patching SDV Graphics Profile...");
-                Game1.graphics.GraphicsProfile = GraphicsProfile.HiDef;
-                LoadMods();
-
-                StardewForm = Control.FromHandle(gamePtr.Window.Handle).FindForm();
-                if (StardewForm != null) StardewForm.Closing += StardewForm_Closing;
-
-                ready = true;
-
-                StardewGameInfo.SetValue(StardewProgramType, gamePtr);
-                gamePtr.Run();
-            }
-            catch (Exception ex)
-            {
-                Log.AsyncR("Game failed to start: " + ex);
-            }
-        }
-
-        private static void StardewForm_Closing(object sender, CancelEventArgs e)
-        {
-            e.Cancel = true;
-
-            if (true || MessageBox.Show("Are you sure you would like to quit Stardew Valley?\nUnsaved progress will be lost!", "Confirm Exit", MessageBoxButtons.YesNo, MessageBoxIcon.Exclamation) == DialogResult.Yes)
-            {
-                gamePtr.Exit();
-                gamePtr.Dispose();
-                StardewForm.Hide();
-                ready = false;
-            }
-        }
-
         public static void LoadMods()
         {
             Log.AsyncY("LOADING MODS");
-            foreach (var ModPath in _modPaths)
+            foreach (string directory in Directory.GetDirectories(ModPath))
             {
-                foreach (var d in Directory.GetDirectories(ModPath))
+                foreach (string manifestFile in Directory.GetFiles(directory, "manifest.json"))
                 {
-                    foreach (var s in Directory.GetFiles(d, "manifest.json"))
+                    if (manifestFile.Contains("StardewInjector"))
+                        continue;
+                    Log.AsyncG("Found Manifest: " + manifestFile);
+                    var manifest = new Manifest();
+                    try
                     {
-                        if (s.Contains("StardewInjector"))
-                            continue;
-                        Log.AsyncG("Found Manifest: " + s);
-                        var manifest = new Manifest();
-                        try
+                        string t = File.ReadAllText(manifestFile);
+                        if (string.IsNullOrEmpty(t))
                         {
-                            var t = File.ReadAllText(s);
-                            if (string.IsNullOrEmpty(t))
-                            {
-                                Log.AsyncR($"Failed to read mod manifest '{s}'. Manifest is empty!");
-                                continue;
-                            }
-
-                            manifest = manifest.InitializeConfig(s);
-
-                            if (string.IsNullOrEmpty(manifest.EntryDll))
-                            {
-                                Log.AsyncR($"Failed to read mod manifest '{s}'. EntryDll is empty!");
-                                continue;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.AsyncR($"Failed to read mod manifest '{s}'. Exception details:\n" + ex);
+                            Log.AsyncR($"Failed to read mod manifest '{manifestFile}'. Manifest is empty!");
                             continue;
                         }
-                        var targDir = Path.GetDirectoryName(s);
-                        var psDir = Path.Combine(targDir, "psconfigs");
-                        Log.AsyncY($"Created psconfigs directory @{psDir}");
-                        try
-                        {
-                            if (manifest.PerSaveConfigs)
-                            {
-                                if (!Directory.Exists(psDir))
-                                {
-                                    Directory.CreateDirectory(psDir);
-                                    Log.AsyncY($"Created psconfigs directory @{psDir}");
-                                }
 
-                                if (!Directory.Exists(psDir))
-                                {
-                                    Log.AsyncR($"Failed to create psconfigs directory '{psDir}'. No exception occured.");
-                                    continue;
-                                }
-                            }
-                        }
-                        catch (Exception ex)
+                        manifest = manifest.InitializeConfig(manifestFile);
+
+                        if (string.IsNullOrEmpty(manifest.EntryDll))
                         {
-                            Log.AsyncR($"Failed to create psconfigs directory '{targDir}'. Exception details:\n" + ex);
+                            Log.AsyncR($"Failed to read mod manifest '{manifestFile}'. EntryDll is empty!");
                             continue;
                         }
-                        var targDll = string.Empty;
-                        try
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.AsyncR($"Failed to read mod manifest '{manifestFile}'. Exception details:\n" + ex);
+                        continue;
+                    }
+                    string targDir = Path.GetDirectoryName(manifestFile);
+                    string psDir = Path.Combine(targDir, "psconfigs");
+                    Log.AsyncY($"Created psconfigs directory @{psDir}");
+                    try
+                    {
+                        if (manifest.PerSaveConfigs)
                         {
-                            targDll = Path.Combine(targDir, manifest.EntryDll);
-                            if (!File.Exists(targDll))
+                            if (!Directory.Exists(psDir))
                             {
-                                Log.AsyncR($"Failed to load mod '{manifest.EntryDll}'. File {targDll} does not exist!");
+                                Directory.CreateDirectory(psDir);
+                                Log.AsyncY($"Created psconfigs directory @{psDir}");
+                            }
+
+                            if (!Directory.Exists(psDir))
+                            {
+                                Log.AsyncR($"Failed to create psconfigs directory '{psDir}'. No exception occured.");
                                 continue;
                             }
-
-                            var mod = Assembly.UnsafeLoadFrom(targDll);
-
-                            if (mod.DefinedTypes.Count(x => x.BaseType == typeof(Mod)) > 0)
-                            {
-                                Log.AsyncY("Loading Mod DLL...");
-                                var tar = mod.DefinedTypes.First(x => x.BaseType == typeof(Mod));
-                                var m = (Mod) mod.CreateInstance(tar.ToString());
-                                if (m != null)
-                                {
-                                    m.PathOnDisk = targDir;
-                                    m.Manifest = manifest;
-                                    Log.AsyncG($"LOADED MOD: {m.Manifest.Name} by {m.Manifest.Authour} - Version {m.Manifest.Version} | Description: {m.Manifest.Description} (@ {targDll})");
-                                    Constants.ModsLoaded += 1;
-                                    m.Entry();
-                                }
-                            }
-                            else
-                            {
-                                Log.AsyncR("Invalid Mod DLL");
-                            }
                         }
-                        catch (Exception ex)
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.AsyncR($"Failed to create psconfigs directory '{targDir}'. Exception details:\n" + ex);
+                        continue;
+                    }
+                    string targDll = string.Empty;
+                    try
+                    {
+                        targDll = Path.Combine(targDir, manifest.EntryDll);
+                        if (!File.Exists(targDll))
                         {
-                            Log.AsyncR($"Failed to load mod '{targDll}'. Exception details:\n" + ex);
+                            Log.AsyncR($"Failed to load mod '{manifest.EntryDll}'. File {targDll} does not exist!");
+                            continue;
                         }
+
+                        Assembly modAssembly = Assembly.UnsafeLoadFrom(targDll);
+                        if (modAssembly.DefinedTypes.Count(x => x.BaseType == typeof(Mod)) > 0)
+                        {
+                            Log.AsyncY("Loading Mod DLL...");
+                            TypeInfo tar = modAssembly.DefinedTypes.First(x => x.BaseType == typeof(Mod));
+                            Mod modEntry = (Mod)modAssembly.CreateInstance(tar.ToString());
+                            if (modEntry != null)
+                            {
+                                modEntry.PathOnDisk = targDir;
+                                modEntry.Manifest = manifest;
+                                Log.AsyncG($"LOADED MOD: {modEntry.Manifest.Name} by {modEntry.Manifest.Authour} - Version {modEntry.Manifest.Version} | Description: {modEntry.Manifest.Description} (@ {targDll})");
+                                Constants.ModsLoaded += 1;
+                                modEntry.Entry();
+                            }
+                        }
+                        else
+                            Log.AsyncR("Invalid Mod DLL");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.AsyncR($"Failed to load mod '{targDll}'. Exception details:\n" + ex);
                     }
                 }
             }
+
             Log.AsyncG($"LOADED {Constants.ModsLoaded} MODS");
             Console.Title = Constants.ConsoleTitle;
         }
 
         public static void ConsoleInputThread()
         {
-            var input = string.Empty;
-
             while (true)
             {
                 Command.CallCommand(Console.ReadLine());
@@ -367,69 +319,11 @@ namespace StardewModdingAPI
         {
             Log.AsyncY("Initializing Debug Assets...");
             DebugPixel = new Texture2D(Game1.graphics.GraphicsDevice, 1, 1);
-            DebugPixel.SetData(new[] {Color.White});
-
-#if DEBUG
-            StardewModdingAPI.Log.Async("REGISTERING BASE CUSTOM ITEM");
-            SObject so = new SObject();
-            so.Name = "Mario Block";
-            so.CategoryName = "SMAPI Test Mod";
-            so.Description = "It's a block from Mario!\nLoaded in realtime by SMAPI.";
-            so.Texture = Texture2D.FromStream(Game1.graphics.GraphicsDevice, new FileStream(_modContentPaths[0] + "\\Test.png", FileMode.Open));
-            so.IsPassable = true;
-            so.IsPlaceable = true;
-            StardewModdingAPI.Log.Async("REGISTERED WITH ID OF: " + SGame.RegisterModItem(so));
-
-            //StardewModdingAPI.Log.Async("REGISTERING SECOND CUSTOM ITEM");
-            //SObject so2 = new SObject();
-            //so2.Name = "Mario Painting";
-            //so2.CategoryName = "SMAPI Test Mod";
-            //so2.Description = "It's a painting of a creature from Mario!\nLoaded in realtime by SMAPI.";
-            //so2.Texture = Texture2D.FromStream(Game1.graphics.GraphicsDevice, new FileStream(_modContentPaths[0] + "\\PaintingTest.png", FileMode.Open));
-            //so2.IsPassable = true;
-            //so2.IsPlaceable = true;
-            //StardewModdingAPI.Log.Async("REGISTERED WITH ID OF: " + SGame.RegisterModItem(so2));
-
-            Command.CallCommand("load");
-#endif
+            DebugPixel.SetData(new[] { Color.White });
         }
 
         private static void Events_KeyPressed(object o, EventArgsKeyPressed e)
         {
-        }
-
-        private static void Events_MenuChanged(IClickableMenu newMenu)
-        {
-            Log.AsyncY("NEW MENU: " + newMenu.GetType());
-            if (newMenu is GameMenu)
-            {
-                Game1.activeClickableMenu = SGameMenu.ConstructFromBaseClass(Game1.activeClickableMenu as GameMenu);
-            }
-        }
-
-        private static void Events_LocationsChanged(List<GameLocation> newLocations)
-        {
-#if DEBUG
-            SGame.ModLocations = SGameLocation.ConstructFromBaseClasses(Game1.locations);
-#endif
-        }
-
-        private static void Events_CurrentLocationChanged(GameLocation newLocation)
-        {
-            //SGame.CurrentLocation = null;
-            //System.Threading.Thread.Sleep(10);
-#if DEBUG
-            Console.WriteLine(newLocation.name);
-            SGame.CurrentLocation = SGame.LoadOrCreateSGameLocationFromName(newLocation.name);
-#endif
-            //Game1.currentLocation = SGame.CurrentLocation;
-            //Log.LogComment(((SGameLocation) newLocation).name);
-            //Log.LogComment("LOC CHANGED: " + SGame.currentLocation.name);
-        }
-
-        public static void StardewInvoke(Action a)
-        {
-            StardewForm.Invoke(a);
         }
 
         private static void help_CommandFired(object o, EventArgsCommand e)
